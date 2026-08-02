@@ -25,6 +25,7 @@ type InitMsg = Extract<ServerMsg, { t: 'init' }>;
 interface Player extends PlayerState {
   img: HTMLImageElement;
   palette: string[];
+  variant: SamuraiVariant;
   sprite: HTMLCanvasElement | null;
   facing: number;
   tx: number; ty: number;
@@ -46,6 +47,50 @@ function parseColor(css: string): [number, number, number] {
   const m = /rgb\((\d+),(\d+),(\d+)\)/.exec(css);
   if (m) return [parseInt(m[1]), parseInt(m[2]), parseInt(m[3])];
   return [128, 128, 128];
+}
+
+type RGB = [number, number, number];
+
+// --- Deterministic per-player variation (seeded from the broadcast avatar hash so
+// every client renders a given player's samurai identically) ---
+function hashStr(s: string): number {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
+function mulberry32(a: number): () => number {
+  return function () {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+interface SamuraiVariant { horn: number; trim: number; weapon: number; blunt: boolean }
+function makeVariant(avatar: string): SamuraiVariant {
+  const rng = mulberry32(hashStr(avatar || 'x'));
+  return { horn: (rng() * 3) | 0, trim: (rng() * 2) | 0, weapon: (rng() * 3) | 0, blunt: rng() < 0.5 };
+}
+
+// --- Colorway helpers: map a player's PayNym palette onto samurai channels ---
+const rgbCss = (c: RGB): string => 'rgb(' + (c[0] | 0) + ',' + (c[1] | 0) + ',' + (c[2] | 0) + ')';
+const darken = (c: RGB, f: number): RGB => [c[0] * f, c[1] * f, c[2] * f];
+const lighten = (c: RGB, f: number): RGB => [c[0] + (255 - c[0]) * f, c[1] + (255 - c[1]) * f, c[2] + (255 - c[2]) * f];
+const clampDark = (c: RGB, max: number): RGB => [Math.min(c[0], max), Math.min(c[1], max), Math.min(c[2], max)];
+const satOf = (c: RGB): number => { const mx = Math.max(c[0], c[1], c[2]), mn = Math.min(c[0], c[1], c[2]); return mx ? (mx - mn) / mx : 0; };
+
+interface SamuraiColors { skin: RGB; clanA: RGB; clanB: RGB; armor: RGB; under: RGB; gold: RGB; boot: RGB; visor: RGB }
+function samuraiColors(pal: string[]): SamuraiColors {
+  const cols: RGB[] = (pal.length ? pal.map(parseColor) : [[210, 150, 70], [40, 40, 60], [60, 25, 25], [70, 70, 110]]) as RGB[];
+  const skin = cols[0] ?? [210, 150, 70];
+  // The two most-saturated avatar colors become the per-user "clan" colors.
+  const bySat = cols.map((c, i) => [i, satOf(c)] as [number, number]).sort((a, b) => b[1] - a[1]);
+  const clanA = cols[bySat[0]?.[0] ?? 0] ?? [150, 40, 40];
+  const clanB = cols[bySat[1]?.[0] ?? 0] ?? lighten(clanA, 0.35);
+  const armor = clampDark(darken(cols[1] ?? [50, 50, 65], 0.32), 64);   // near-black plates
+  const under = clampDark(darken(clanA, 0.45), 90);                     // maroon-ish underlayer
+  return { skin, clanA, clanB, armor, under, gold: [217, 164, 65], boot: [45, 32, 20], visor: [17, 17, 22] };
 }
 
 function extractPalette(img: HTMLImageElement): string[] {
@@ -153,6 +198,7 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
     const img = new Image();
     const player: Player = {
       ...p, img, palette: ['#c8b890', '#5a4a6a', '#3a3a4a', '#8a6a45'],
+      variant: makeVariant(p.avatar),
       sprite: null, facing: 0,
       tx: p.x, ty: p.y, rx: p.x, ry: p.y,
       path: [], nextStepAt: 0, bubble: null,
@@ -434,8 +480,8 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
       ctx.drawImage(p.sprite, frameX, frameY, SPRITE_W, SPRITE_H,
         sx - SPRITE_W / 2, feetY - SPRITE_H + bob, SPRITE_W, SPRITE_H);
     } else {
-      // --- Procedural fallback ---
-      drawPlayerProcedural(p, now, sx, feetY, bob, walkFrame, moving);
+      // --- Procedural samurai-Pepe (no sprite sheet asset) ---
+      drawSamurai(p, sx, feetY, bob, walkFrame, moving);
     }
 
     // Name tag
@@ -462,57 +508,121 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
     ctx.textAlign = 'left';
   }
 
-  // Procedural character (used when no sprite sheet is available)
-  function drawPlayerProcedural(p: Player, now: number, sx: number, feetY: number, bob: number, walkFrame: number, moving: boolean): void {
-    var top = feetY - 44 + bob;
-    var pal = p.palette;
-    var skin = pal[0] || '#c8b890';
-    var shirt = pal[1] || '#5a4a6a';
-    var pants = pal[2] || '#3a3a4a';
-    var accent = pal[3] || shirt;
-
-    // Legs + boots
-    var legY = feetY - 10 + bob;
-    var legOff = moving ? [0, 2, 0, -2][walkFrame] : 0;
-    ctx.fillStyle = pants;
-    ctx.fillRect(sx - 5, legY, 4, 7);
-    ctx.fillRect(sx + 1, legY + legOff, 4, 7);
-    ctx.fillStyle = '#2a1a0a';
-    ctx.fillRect(sx - 5, legY + 7, 4, 3);
-    ctx.fillRect(sx + 1, legY + legOff + 7, 4, 3);
-
-    // Tunic torso (trapezoid)
-    ctx.fillStyle = shirt;
-    ctx.beginPath();
-    ctx.moveTo(sx - 6, top + 16); ctx.lineTo(sx + 6, top + 16);
-    ctx.lineTo(sx + 7, top + 26); ctx.lineTo(sx - 7, top + 26);
-    ctx.closePath(); ctx.fill();
-
-    // Shading
-    ctx.fillStyle = 'rgba(0,0,0,.18)';
-    ctx.beginPath();
-    ctx.moveTo(sx, top + 16); ctx.lineTo(sx + 6, top + 16);
-    ctx.lineTo(sx + 7, top + 26); ctx.lineTo(sx, top + 26);
-    ctx.closePath(); ctx.fill();
-
-    // Belt
-    ctx.fillStyle = accent;
-    ctx.fillRect(sx - 7, top + 25, 14, 2);
-
-    // Arms
-    ctx.fillStyle = skin;
-    ctx.fillRect(sx - 8, top + 17, 3, 9);
-    ctx.fillRect(sx + 5, top + 17, 3, 9);
-
-    // Head = Pepe PNG
+  // Procedural samurai-Pepe. Colorway comes from the player's PayNym palette and the
+  // structural variant from the avatar hash, so every client draws a given player the same.
+  function drawSamurai(p: Player, sx: number, feetY: number, bob: number, walkFrame: number, moving: boolean): void {
+    const back = p.facing === 1;
+    const v = p.variant;
+    const col = samuraiColors(p.palette);
+    const ub = bob;
+    const legOff = moving ? [0, 1, 0, 1][walkFrame] : 0;
+    const A = rgbCss(col.armor), U = rgbCss(col.under), CA = rgbCss(col.clanA), CB = rgbCss(col.clanB),
+      SK = rgbCss(col.skin), GD = rgbCss(col.gold), BT = rgbCss(col.boot), VZ = rgbCss(col.visor);
     ctx.imageSmoothingEnabled = false;
-    var headSize = 16;
-    var headX = sx - headSize / 2;
-    var headY = top + bob;
-    if (p.img.complete && p.img.naturalWidth) {
-      ctx.drawImage(p.img, headX, headY, headSize, headSize);
+    const R = (x: number, y: number, w: number, h: number, c: string): void => {
+      ctx.fillStyle = c; ctx.fillRect(Math.round(sx + x), Math.round(feetY + y), w, h);
+    };
+    const tri = (x1: number, y1: number, x2: number, y2: number, x3: number, y3: number, c: string): void => {
+      ctx.fillStyle = c; ctx.beginPath();
+      ctx.moveTo(sx + x1, feetY + y1); ctx.lineTo(sx + x2, feetY + y2); ctx.lineTo(sx + x3, feetY + y3);
+      ctx.closePath(); ctx.fill();
+    };
+
+    // Boots + gold toes
+    R(-8, -5, 7, 5, BT); R(1, -5 + legOff, 7, 5, BT);
+    if (!back) { R(-8, -2, 3, 2, GD); R(5, -2 + legOff, 3, 2, GD); }
+    // Greaves (shin armor, maroon)
+    R(-7, -13, 5, 8, U); R(2, -13 + legOff, 5, 8, U);
+
+    // Kusazuri (lamellar skirt) — trapezoid with clan lacing rows
+    ctx.fillStyle = A; ctx.beginPath();
+    ctx.moveTo(sx - 9, feetY - 22 + ub); ctx.lineTo(sx + 9, feetY - 22 + ub);
+    ctx.lineTo(sx + 11, feetY - 11); ctx.lineTo(sx - 11, feetY - 11); ctx.closePath(); ctx.fill();
+    R(-10, -19 + ub, 20, 1, CB); R(-10, -15 + ub, 20, 1, CB);
+    R(-11, -13, 2, 2, U); R(9, -13, 2, 2, U);
+
+    // Far shoulder guard (behind torso, for depth)
+    R(8, -33 + ub, 6, 11, A); R(8, -33 + ub, 6, 2, CA);
+
+    // Torso (do) with plate highlight + maroon underlayer at the sides
+    R(-9, -34 + ub, 18, 13, A);
+    R(-9, -34 + ub, 18, 1, rgbCss(lighten(col.armor, 0.25)));
+    R(-9, -24 + ub, 2, 3, U); R(7, -24 + ub, 2, 3, U);
+
+    if (back) {
+      R(-5, -33 + ub, 1, 11, CB); R(0, -33 + ub, 1, 11, CB); R(4, -33 + ub, 1, 11, CB);
     } else {
-      ctx.fillStyle = skin; ctx.fillRect(headX, headY, headSize, headSize);
+      R(-1, -33 + ub, 2, 9, CB);   // chest cord
+      R(-4, -25 + ub, 8, 3, CB);   // sash band
+      R(-2, -24 + ub, 4, 4, CB);   // sash knot
+    }
+
+    // Near shoulder guard + orange hands
+    R(-14, -33 + ub, 6, 11, A); R(-14, -33 + ub, 6, 2, CA);
+    R(-13, -22 + ub, 3, 5, SK); R(10, -22 + ub, 3, 5, SK);
+
+    // Weapon (hash-picked)
+    if (v.weapon === 0) {
+      if (back) { // katana sheathed across the back
+        ctx.strokeStyle = '#2a2a2a'; ctx.lineWidth = 2; ctx.beginPath();
+        ctx.moveTo(sx - 8, feetY - 30 + ub); ctx.lineTo(sx + 9, feetY - 14 + ub); ctx.stroke();
+      } else { // katana held low
+        ctx.strokeStyle = '#c9ccd1'; ctx.lineWidth = 2; ctx.beginPath();
+        ctx.moveTo(sx - 12, feetY - 20 + ub); ctx.lineTo(sx - 22, feetY - 2 + ub); ctx.stroke();
+        R(-13, -22 + ub, 3, 2, GD); // tsuba
+      }
+    } else if (v.weapon === 1) { // naginata
+      ctx.strokeStyle = '#6b4a2a'; ctx.lineWidth = 2; ctx.beginPath();
+      ctx.moveTo(sx + 12, feetY - 30 + ub); ctx.lineTo(sx + 14, feetY - 2 + ub); ctx.stroke();
+      tri(12, -30 + ub, 18, -34 + ub, 13, -26 + ub, '#c9ccd1');
+    }
+
+    // Kabuto dome + neck flare + ridge
+    ctx.fillStyle = A; ctx.beginPath(); ctx.ellipse(sx, feetY - 38 + ub, 9, 7, 0, Math.PI, 0); ctx.fill();
+    R(-9, -38 + ub, 18, 4, A);
+    R(-1, -45 + ub, 2, 7, rgbCss(lighten(col.armor, 0.2)));
+
+    // Horns (clanA) — hash-picked style
+    if (v.horn === 0) { // straight spikes
+      tri(-8, -44 + ub, -6, -53 + ub, -4, -44 + ub, CA);
+      tri(4, -44 + ub, 6, -53 + ub, 8, -44 + ub, CA);
+    } else if (v.horn === 1) { // kuwagata crescents
+      R(-9, -50 + ub, 3, 7, CA); R(-9, -51 + ub, 6, 2, CA);
+      R(6, -50 + ub, 3, 7, CA); R(3, -51 + ub, 6, 2, CA);
+    } else { // forked antlers
+      tri(-7, -44 + ub, -8, -52 + ub, -5, -45 + ub, CA); tri(-8, -52 + ub, -11, -50 + ub, -7, -49 + ub, CA);
+      tri(7, -44 + ub, 8, -52 + ub, 5, -45 + ub, CA); tri(8, -52 + ub, 11, -50 + ub, 7, -49 + ub, CA);
+    }
+
+    // Maedate crest disc for some trims (front)
+    if (!back && v.trim === 1) {
+      ctx.fillStyle = CA; ctx.beginPath(); ctx.arc(sx, feetY - 40 + ub, 3, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = GD; ctx.beginPath(); ctx.arc(sx, feetY - 40 + ub, 1.3, 0, Math.PI * 2); ctx.fill();
+    }
+
+    if (back) {
+      R(-8, -36 + ub, 16, 3, rgbCss(darken(col.armor, 0.8)));
+      ctx.fillStyle = CB;
+      for (let i = -6; i <= 6; i += 3) { ctx.beginPath(); ctx.arc(sx + i, feetY - 35 + ub, 1.2, 0, Math.PI * 2); ctx.fill(); }
+    } else {
+      // Orange snout + black VR visor
+      R(-5, -36 + ub, 10, 4, SK);
+      R(-4, -33 + ub, 8, 1, rgbCss(darken(col.skin, 0.7)));
+      R(-7, -41 + ub, 14, 5, VZ);
+      R(-7, -41 + ub, 14, 1, 'rgba(255,255,255,.6)');
+      ctx.fillStyle = CB;
+      for (let j = -5; j <= 5; j += 2.5) { ctx.beginPath(); ctx.arc(sx + j, feetY - 31 + ub, 1.1, 0, Math.PI * 2); ctx.fill(); }
+      // Flourish: the actual PayNym avatar shown on the visor screen
+      if (p.img.complete && p.img.naturalWidth) {
+        ctx.globalAlpha = 0.85;
+        ctx.drawImage(p.img, Math.round(sx - 6), Math.round(feetY - 41 + ub), 12, 5);
+        ctx.globalAlpha = 1;
+      }
+      // Striped blunt (hash-picked)
+      if (v.blunt) {
+        for (let b = 0; b < 5; b++) R(6 + b * 2, -35 + ub, 2, 2, b % 2 ? '#c0392b' : '#ecf0f1');
+        ctx.fillStyle = 'rgba(220,220,220,.5)'; ctx.beginPath(); ctx.arc(sx + 18, feetY - 36 + ub, 2, 0, Math.PI * 2); ctx.fill();
+      }
     }
   }
 
