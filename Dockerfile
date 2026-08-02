@@ -14,7 +14,8 @@ RUN npm install --omit=dev
 COPY server server
 COPY shared shared
 COPY public public
-COPY vendors.json .
+COPY peers.json .
+COPY room.json .
 COPY --from=build /app/public/engine.js public/engine.js
 EXPOSE 3000
 CMD ["node", "server/index.ts"]

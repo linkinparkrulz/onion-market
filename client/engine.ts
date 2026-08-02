@@ -1,4 +1,4 @@
-import type { ServerMsg, ClientMsg, PlayerState, Portal } from '../shared/protocol.ts';
+import type { ServerMsg, ClientMsg, PlayerState, Portal, Stall } from '../shared/protocol.ts';
 
 const TILE_W = 64, TILE_H = 32, WALL_H = 56;
 const WALK_MS = 320;
@@ -124,10 +124,11 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
   const blocked = new Set(init.map.blocked);
   const myId = init.you;
   const players = new Map<number, Player>();
-  var ssoToken: string | null = init.ssoToken ?? null;
-
   const portalMap = new Map<string, Portal>();
   if (init.portals) { for (const p of init.portals) portalMap.set(p.tile, p); }
+
+  const stallMap = new Map<string, Stall>();
+  if (init.stalls) { for (const s of init.stalls) stallMap.set(s.tile, s); }
 
   // Load character sprite sheet (optional — falls back to procedural if missing)
   var spriteSheet: HTMLImageElement | null = null;
@@ -162,7 +163,7 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
         player.sprite = createPlayerSprite(img, player.palette, spriteSheet);
       }
     };
-    img.src = '/api/avatar/' + p.code;
+    img.src = '/api/avatar/' + p.avatar;
     players.set(p.id, player);
   }
   init.players.forEach(addPlayer);
@@ -170,6 +171,7 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
   ws.onmessage = (ev: MessageEvent) => {
     const m = JSON.parse(ev.data as string) as ServerMsg;
     if (m.t === 'join') addPlayer(m.player);
+    else if (m.t === 'sso') openPortal(m.dest, m.token);
     else if (m.t === 'leave') players.delete(m.id);
     else if (m.t === 'chat') {
       const p = players.get(m.id);
@@ -229,18 +231,51 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
     const tk = key(hover[0], hover[1]);
     if (portalMap.has(tk)) {
       var portal = portalMap.get(tk)!;
-      if (portal.onion) {
-        var url = 'http://' + portal.onion + '/';
-        if (ssoToken) url += '?sso=' + encodeURIComponent(ssoToken);
-        window.open(url, '_blank');
-      }
+      // Ask our server for a destination-bound SSO token, then open the peer's onion.
+      if (portal.onion) send({ t: 'portal', dest: portal.onion });
       return;
     }
+    if (stallMap.has(tk)) { showWares(stallMap.get(tk)!); return; }
     var me = players.get(myId);
     if (!me || blocked.has(tk)) return;
     var path = findPath(Math.round(me.rx), Math.round(me.ry), hover[0], hover[1]);
     if (path?.length) { me.path = path; me.nextStepAt = 0; }
   });
+
+  function openPortal(dest: string, token: string): void {
+    window.open('http://' + dest + '/?sso=' + encodeURIComponent(token) + '&room=vendor', '_blank');
+  }
+
+  // --- Wares panel (DOM overlay) ---
+  var waresEl: HTMLDivElement | null = null;
+  function showWares(stall: Stall): void {
+    if (!waresEl) {
+      waresEl = document.createElement('div');
+      waresEl.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);' +
+        'background:#1d1628;border:1px solid #3b2d4a;color:#eee;font-family:monospace;font-size:12px;' +
+        'padding:1rem;max-width:340px;width:80%;max-height:70vh;overflow-y:auto;z-index:10;box-shadow:0 8px 40px rgba(0,0,0,.6)';
+      document.getElementById('room')!.appendChild(waresEl);
+    }
+    var rows = stall.wares.map(function (w) {
+      var price = w.priceSats != null ? (' — ' + w.priceSats.toLocaleString() + ' sats') : '';
+      return '<div style="padding:.35rem 0;border-top:1px solid #2a2038">' +
+        '<b>' + esc(w.name) + '</b>' + price +
+        (w.desc ? '<div style="opacity:.7">' + esc(w.desc) + '</div>' : '') + '</div>';
+    }).join('');
+    waresEl.innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:center">' +
+      '<b style="color:#ffd870">' + esc(stall.name) + '</b>' +
+      '<span id="wares-x" style="cursor:pointer;opacity:.7">✕</span></div>' +
+      rows +
+      '<div style="margin-top:.75rem;opacity:.7">pay with your wallet (BIP47):</div>' +
+      (stall.qr ? '<img src="' + stall.qr + '" width="180" style="display:block;margin:.4rem auto;image-rendering:pixelated">' : '') +
+      '<div style="word-break:break-all;font-size:10px;background:#0e0a14;padding:.4rem">' + esc(stall.payCode) + '</div>';
+    waresEl.hidden = false;
+    (document.getElementById('wares-x') as HTMLElement).onclick = function () { waresEl!.hidden = true; };
+  }
+  function esc(s: string): string {
+    return s.replace(/[&<>"]/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' } as Record<string, string>)[c]; });
+  }
 
   function findPath(sx: number, sy: number, gx: number, gy: number): [number, number][] | null {
     const open: [number, number][] = [[sx, sy]];
@@ -337,6 +372,32 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
     ctx.fillStyle = '#1a0e2a'; ctx.beginPath(); ctx.arc(cx, cy - doorH + 10, 13, Math.PI, 0); ctx.fill();
     ctx.font = '9px monospace'; ctx.fillStyle = '#ffd870'; ctx.textAlign = 'center';
     ctx.fillText(portal.name, cx, cy - doorH - 2); ctx.textAlign = 'left';
+  }
+
+  function drawStall(x: number, y: number, stall: Stall): void {
+    var [cx, cy] = toScreen(x, y); var BH = 16;
+    // Table top
+    diamond(cx, cy - BH, C.crate);
+    ctx.fillStyle = C.crateDark; ctx.beginPath();
+    ctx.moveTo(cx - TILE_W / 2, cy - BH); ctx.lineTo(cx, cy - BH + TILE_H / 2);
+    ctx.lineTo(cx, cy + TILE_H / 2); ctx.lineTo(cx - TILE_W / 2, cy); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = C.floorEdge; ctx.beginPath();
+    ctx.moveTo(cx + TILE_W / 2, cy - BH); ctx.lineTo(cx, cy - BH + TILE_H / 2);
+    ctx.lineTo(cx, cy + TILE_H / 2); ctx.lineTo(cx + TILE_W / 2, cy); ctx.closePath(); ctx.fill();
+    // Striped awning
+    var awnY = cy - BH - 30;
+    for (var i = 0; i < 4; i++) {
+      ctx.fillStyle = i % 2 ? '#c0392b' : '#ecf0f1';
+      ctx.fillRect(cx - 22 + i * 11, awnY, 11, 10);
+    }
+    ctx.fillStyle = '#7a2018'; ctx.fillRect(cx - 22, awnY + 10, 44, 3);
+    // Goods bumps on the table
+    ctx.fillStyle = '#caa15a';
+    ctx.beginPath(); ctx.arc(cx - 8, cy - BH - 2, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx + 6, cy - BH - 1, 3, 0, Math.PI * 2); ctx.fill();
+    // Label
+    ctx.font = '9px monospace'; ctx.fillStyle = '#ffd870'; ctx.textAlign = 'center';
+    ctx.fillText(stall.name, cx, awnY - 3); ctx.textAlign = 'left';
   }
 
   function drawPlayer(p: Player, now: number): void {
@@ -463,6 +524,7 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
     for (var k of blocked) {
       var [x, y] = k.split(',').map(Number);
       if (portalMap.has(k)) { var portal = portalMap.get(k)!; drawables.push({ s: x + y, f: () => drawPortal(x, y, portal) }); }
+      else if (stallMap.has(k)) { var stall = stallMap.get(k)!; drawables.push({ s: x + y, f: () => drawStall(x, y, stall) }); }
       else { drawables.push({ s: x + y, f: () => drawCrate(x, y) }); }
     }
     for (var p of players.values()) drawables.push({ s: p.rx + p.ry + 0.5, f: () => drawPlayer(p, now) });

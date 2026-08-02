@@ -8,6 +8,12 @@ import type { NymProfile } from '../shared/protocol.ts';
 const LOOKUP = 'https://paynym.rs/api/v1/nym/';
 const AVATAR = (code: string) => `https://paynym.rs/${code}/avatar`;
 
+// One-way avatar handle derived from a payment code. Broadcast to clients in place
+// of the raw BIP47 code so payment codes can't be harvested from a room.
+export function avatarIdFor(paymentCode: string): string {
+  return createHash('sha256').update(paymentCode).digest('hex').slice(0, 24);
+}
+
 const agent = process.env.TOR_SOCKS ? new SocksProxyAgent(process.env.TOR_SOCKS) : undefined;
 
 interface FetchResult { status: number; body: Buffer }
@@ -52,11 +58,19 @@ export class PayNymService {
     return profile;
   }
 
+  // Absolute path of the cached avatar for a handle (may not exist yet).
+  fileForId(avatarId: string): string {
+    return path.join(this.cacheDir, avatarId + '.png');
+  }
+
   async ensureAvatar(paymentCode: string): Promise<string> {
-    const file = path.join(
-      this.cacheDir,
-      createHash('sha256').update(paymentCode).digest('hex').slice(0, 24) + '.png',
-    );
+    return this.ensureAvatarById(avatarIdFor(paymentCode), paymentCode);
+  }
+
+  // Fetch + cache the avatar under its handle. Called at session creation so the
+  // per-id avatar route can serve it without ever seeing the raw payment code.
+  async ensureAvatarById(avatarId: string, paymentCode: string): Promise<string> {
+    const file = this.fileForId(avatarId);
     try { await readFile(file); return file; } catch {}
     const res = await fetchBuf(AVATAR(paymentCode));
     if (res.status !== 200) throw new Error(`avatar fetch failed: ${res.status}`);

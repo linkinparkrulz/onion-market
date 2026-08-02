@@ -2,11 +2,12 @@ import { randomBytes } from 'node:crypto';
 import * as ecc from 'tiny-secp256k1';
 import { Auth47Verifier } from '@samouraiwallet/auth47';
 import type { Auth47Proof } from '../shared/protocol.ts';
+import { avatarIdFor } from './paynym.ts';
 
 const TTL_MS = 5 * 60 * 1000;
 
 interface Challenge { expiresAt: number; used: boolean }
-export interface Session { paymentCode: string; nymName: string | null; ssoToken?: string }
+export interface Session { paymentCode: string; nymName: string | null; avatar: string }
 
 const parseNonce = (uri?: string): string | null => {
   const m = /^auth47:\/\/([0-9a-f]{32})/i.exec(uri ?? '');
@@ -37,7 +38,7 @@ export class Auth47Service {
   async verifyProof(proof: Auth47Proof): Promise<{ nonce: string; token: string; paymentCode: string }> {
     const nonce = parseNonce(proof?.challenge);
     const ch = nonce ? this.challenges.get(nonce) : undefined;
-    if (!ch) throw new Error('unknown challenge');
+    if (!nonce || !ch) throw new Error('unknown challenge');
     if (ch.used) throw new Error('challenge already spent');
     if (Date.now() > ch.expiresAt) throw new Error('challenge expired');
 
@@ -51,7 +52,7 @@ export class Auth47Service {
 
     ch.used = true;
     const token = randomBytes(32).toString('hex');
-    this.sessions.set(token, { paymentCode: proof.nym, nymName: null });
+    this.sessions.set(token, { paymentCode: proof.nym, nymName: null, avatar: avatarIdFor(proof.nym) });
     return { nonce, token, paymentCode: proof.nym };
   }
 
@@ -60,13 +61,8 @@ export class Auth47Service {
     if (s) s.nymName = profile?.nymName ?? null;
   }
 
-  attachSSOToken(token: string, ssoToken: string): void {
-    const s = this.sessions.get(token);
-    if (s) s.ssoToken = ssoToken;
-  }
-
   createSessionFromSSO(token: string, paymentCode: string, nymName: string | null): void {
-    this.sessions.set(token, { paymentCode, nymName });
+    this.sessions.set(token, { paymentCode, nymName, avatar: avatarIdFor(paymentCode) });
   }
 
   complete(nonce: string, token: string): void {
