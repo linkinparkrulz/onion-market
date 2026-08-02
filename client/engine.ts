@@ -26,6 +26,7 @@ interface Player extends PlayerState {
   img: HTMLImageElement;
   palette: string[];
   variant: SamuraiVariant;
+  cutout: CutResult | null;
   sprite: HTMLCanvasElement | null;
   facing: number;
   tx: number; ty: number;
@@ -91,6 +92,123 @@ function samuraiColors(pal: string[]): SamuraiColors {
   const armor = clampDark(darken(cols[1] ?? [50, 50, 65], 0.32), 64);   // near-black plates
   const under = clampDark(darken(clanA, 0.45), 90);                     // maroon-ish underlayer
   return { skin, clanA, clanB, armor, under, gold: [217, 164, 65], boot: [45, 32, 20], visor: [17, 17, 22] };
+}
+
+// --- Real-avatar rendering: isolate the paynym bust from its (per-avatar, possibly
+// patterned) background, then extend it into a walking body. ---
+export interface CutResult { cv: HTMLCanvasElement; minX: number; maxX: number; minY: number; maxY: number; shoulderMin: number; shoulderMax: number }
+
+// Flood-fill the background inward from the borders by colour-similarity (bounded by the
+// character's dark outline), then keep only the component at the centre so background
+// islands (e.g. silhouette patterns) are dropped. Pure function of the avatar PNG →
+// identical on every client. Returns null if the result is degenerate (→ caller falls back).
+function cutout(img: HTMLImageElement): CutResult | null {
+  const w = img.naturalWidth, h = img.naturalHeight;
+  if (!w || !h) return null;
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+  const cx = cv.getContext('2d');
+  if (!cx) return null;
+  cx.imageSmoothingEnabled = false; cx.drawImage(img, 0, 0);
+  let d: ImageData;
+  try { d = cx.getImageData(0, 0, w, h); } catch { return null; } // tainted → bail
+  const a = d.data, N = w * h;
+  const S: number[][] = [];
+  for (let x = 0; x < w; x += 8) { S.push([a[x * 4], a[x * 4 + 1], a[x * 4 + 2]]); const i = ((h - 1) * w + x) * 4; S.push([a[i], a[i + 1], a[i + 2]]); }
+  for (let y = 0; y < h; y += 8) { let i = (y * w) * 4; S.push([a[i], a[i + 1], a[i + 2]]); i = (y * w + w - 1) * 4; S.push([a[i], a[i + 1], a[i + 2]]); }
+  const TOL = 52 * 52;
+  const mind = (i: number): number => {
+    const r = a[i * 4], g = a[i * 4 + 1], b = a[i * 4 + 2]; let m = 1e9;
+    for (const s of S) { const dr = r - s[0], dg = g - s[1], db = b - s[2]; const dd = dr * dr + dg * dg + db * db; if (dd < m) { m = dd; if (m < 64) break; } }
+    return m;
+  };
+  const bg = new Uint8Array(N), st: number[] = [];
+  const seed = (i: number): void => { if (!bg[i] && mind(i) < TOL) { bg[i] = 1; st.push(i); } };
+  for (let x = 0; x < w; x++) { seed(x); seed((h - 1) * w + x); }
+  for (let y = 0; y < h; y++) { seed(y * w); seed(y * w + w - 1); }
+  while (st.length) { const i = st.pop()!; const x = i % w, y = (i / w) | 0; if (x > 0) seed(i - 1); if (x < w - 1) seed(i + 1); if (y > 0) seed(i - w); if (y < h - 1) seed(i + w); }
+  // Keep the non-background component around the centre (drops background islands).
+  const keep = new Uint8Array(N), ks: number[] = [];
+  const y0 = (h * 0.46) | 0, y1 = (h * 0.54) | 0, x0 = (w * 0.46) | 0, x1 = (w * 0.54) | 0;
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { const i = y * w + x; if (!bg[i] && !keep[i]) { keep[i] = 1; ks.push(i); } }
+  while (ks.length) {
+    const i = ks.pop()!; const x = i % w, y = (i / w) | 0;
+    if (x > 0 && !bg[i - 1] && !keep[i - 1]) { keep[i - 1] = 1; ks.push(i - 1); }
+    if (x < w - 1 && !bg[i + 1] && !keep[i + 1]) { keep[i + 1] = 1; ks.push(i + 1); }
+    if (y > 0 && !bg[i - w] && !keep[i - w]) { keep[i - w] = 1; ks.push(i - w); }
+    if (y < h - 1 && !bg[i + w] && !keep[i + w]) { keep[i + w] = 1; ks.push(i + w); }
+  }
+  let kept = 0, minX = w, maxX = 0, minY = h, maxY = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (keep[y * w + x]) { kept++; if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+  if (kept < N * 0.03 || kept > N * 0.97 || maxX <= minX || maxY <= minY) return null; // degenerate → fallback
+  for (let i = 0; i < N; i++) if (!keep[i]) a[i * 4 + 3] = 0;
+  cx.putImageData(d, 0, 0);
+  let sMin = w, sMax = 0;
+  for (let y = Math.max(0, maxY - 12); y <= maxY; y++) for (let x = 0; x < w; x++) if (keep[y * w + x]) { if (x < sMin) sMin = x; if (x > sMax) sMax = x; }
+  return { cv, minX, maxX, minY, maxY, shoulderMin: sMin, shoulderMax: sMax };
+}
+
+// Composite the exact cut-out bust on top of a dark procedural lower body sized to the
+// bust's shoulders and colour-matched to its armour.
+function drawCharacter(ctx: CanvasRenderingContext2D, cut: CutResult, sx: number, feetY: number, headH: number, walkFrame: number, flip: boolean, bob: number): void {
+  const cropW = cut.maxX - cut.minX, cropH = cut.maxY - cut.minY;
+  const s = headH / cropH, shoulder = (cut.shoulderMax - cut.shoulderMin) * s;
+  let rr = 40, gg = 40, bb = 48;
+  const bctx = cut.cv.getContext('2d');
+  if (bctx) {
+    const bd = bctx.getImageData(cut.shoulderMin, Math.max(0, cut.maxY - 6), Math.max(1, cut.shoulderMax - cut.shoulderMin), 6).data;
+    let R = 0, G = 0, B = 0, n = 0;
+    for (let i = 0; i < bd.length; i += 4) if (bd[i + 3] > 200) { R += bd[i]; G += bd[i + 1]; B += bd[i + 2]; n++; }
+    if (n) { rr = R / n; gg = G / n; bb = B / n; }
+  }
+  const arm = `rgb(${rr | 0},${gg | 0},${bb | 0})`, dark = `rgb(${rr * 0.6 | 0},${gg * 0.6 | 0},${bb * 0.6 | 0})`, boot = `rgb(${rr * 0.42 | 0},${gg * 0.42 | 0},${bb * 0.42 | 0})`;
+  const seam = `rgb(${Math.min(255, rr * 1.7) | 0},${Math.min(255, gg * 1.7) | 0},${Math.min(255, bb * 1.8) | 0})`;
+  const GOLD = 'rgb(217,164,65)', LACE = '#2f45c8', LACED = '#1e2c86';
+  // Habbo/Coke-Music stature: big head (bust) dominates; compact chunky body below.
+  const bodyH = headH * 0.9;
+  const bootH = bodyH * 0.20, legH = bodyH * 0.20, skirtH = bodyH * 0.44, torsoH = bodyH * 0.16, ov = headH * 0.06;
+  const hw = Math.max(6, shoulder / 2), legOff = walkFrame ? Math.max(1, bodyH * 0.05) : 0;
+  const legTop = feetY - bootH - legH, skirtTop = legTop - skirtH, torsoTop = skirtTop - torsoH;
+  const bustBottom = torsoTop + ov, bustTop = bustBottom - headH + bob;
+  ctx.save();
+  if (flip) { ctx.translate(sx * 2, 0); ctx.scale(-1, 1); }
+
+  // Big chunky boots with gold toe caps
+  const bw = hw * 0.6;
+  ctx.fillStyle = boot;
+  ctx.fillRect(sx - hw * 0.72, feetY - bootH, bw, bootH);
+  ctx.fillRect(sx + hw * 0.72 - bw, feetY - bootH + legOff, bw, bootH);
+  ctx.fillStyle = GOLD;
+  ctx.fillRect(sx - hw * 0.72, feetY - 2, bw, 2);
+  ctx.fillRect(sx + hw * 0.72 - bw, feetY - 2 + legOff, bw, 2);
+  // Short stubby legs (hakama)
+  ctx.fillStyle = dark;
+  ctx.fillRect(sx - hw * 0.66, legTop, hw * 0.58, legH + 1);
+  ctx.fillRect(sx + hw * 0.08, legTop + legOff, hw * 0.58, legH + 1);
+
+  // Kusazuri skirt: layered lamellar plate rows, flaring, gold-trimmed
+  const ROWS = 3;
+  for (let r = 0; r < ROWS; r++) {
+    const t = skirtTop + (skirtH / ROWS) * r, rb = skirtTop + (skirtH / ROWS) * (r + 1);
+    const wT = hw * (1.0 + r * 0.13), wB = hw * (1.0 + (r + 1) * 0.13);
+    ctx.fillStyle = arm;
+    ctx.beginPath(); ctx.moveTo(sx - wT, t); ctx.lineTo(sx + wT, t); ctx.lineTo(sx + wB, rb - 1); ctx.lineTo(sx - wB, rb - 1); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = seam;
+    for (let k = -2; k <= 2; k++) ctx.fillRect(sx + k * wB * 0.4 - 0.5, t + 1, 1, rb - t - 2);
+    ctx.fillStyle = GOLD; ctx.fillRect(sx - wB, rb - 2, wB * 2, 1.5);
+  }
+  // Front tasset with blue odoshi lacing down the centre
+  ctx.fillStyle = LACED; ctx.fillRect(sx - hw * 0.24, skirtTop, hw * 0.48, skirtH);
+  ctx.fillStyle = LACE;
+  for (let r = 0; r < 4; r++) { const y = skirtTop + (skirtH / 4) * (r + 0.5); ctx.fillRect(sx - hw * 0.2, y - 1.5, hw * 0.4, 3); }
+
+  // Do (torso continuation) — mostly hidden under the bust overlap
+  ctx.fillStyle = arm; ctx.fillRect(sx - hw, torsoTop + bob, hw * 2, torsoH + ov);
+  ctx.fillStyle = GOLD; ctx.fillRect(sx - hw, torsoTop + torsoH + bob - 1, hw * 2, 1.2);
+
+  // Exact avatar bust on top
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(cut.cv, cut.minX, cut.minY, cropW, cropH, sx - cropW * s / 2, bustTop, cropW * s, headH);
+  ctx.restore();
 }
 
 function extractPalette(img: HTMLImageElement): string[] {
@@ -199,12 +317,13 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
     const player: Player = {
       ...p, img, palette: ['#c8b890', '#5a4a6a', '#3a3a4a', '#8a6a45'],
       variant: makeVariant(p.avatar),
-      sprite: null, facing: 0,
+      cutout: null, sprite: null, facing: 0,
       tx: p.x, ty: p.y, rx: p.x, ry: p.y,
       path: [], nextStepAt: 0, bubble: null,
     };
     img.onload = function() {
       player.palette = extractPalette(img);
+      player.cutout = cutout(img);   // isolate the real avatar → rendered as the character
       if (spriteSheet) {
         player.sprite = createPlayerSprite(img, player.palette, spriteSheet);
       }
@@ -472,7 +591,10 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
       ctx.beginPath(); ctx.ellipse(sx, feetY, 14, 6, 0, 0, Math.PI * 2); ctx.stroke();
     }
 
-    if (p.sprite) {
+    if (p.cutout) {
+      // --- Real avatar: exact cut-out bust + extended body ---
+      drawCharacter(ctx, p.cutout, sx, feetY, 40, moving ? walkFrame & 1 : 0, dir === 2, bob);
+    } else if (p.sprite) {
       // --- Sprite sheet mode ---
       ctx.imageSmoothingEnabled = false;
       var frameX = walkFrame * SPRITE_W;
@@ -480,7 +602,7 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
       ctx.drawImage(p.sprite, frameX, frameY, SPRITE_W, SPRITE_H,
         sx - SPRITE_W / 2, feetY - SPRITE_H + bob, SPRITE_W, SPRITE_H);
     } else {
-      // --- Procedural samurai-Pepe (no sprite sheet asset) ---
+      // --- Procedural samurai-Pepe fallback (until the avatar image loads) ---
       drawSamurai(p, sx, feetY, bob, walkFrame, moving);
     }
 
@@ -631,13 +753,13 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
     ctx.fillRect(0, 0, canvas.clientWidth, canvas.clientHeight);
     drawWalls(); drawFloor();
     var drawables: { s: number; f: () => void }[] = [];
-    for (var k of blocked) {
-      var [x, y] = k.split(',').map(Number);
-      if (portalMap.has(k)) { var portal = portalMap.get(k)!; drawables.push({ s: x + y, f: () => drawPortal(x, y, portal) }); }
-      else if (stallMap.has(k)) { var stall = stallMap.get(k)!; drawables.push({ s: x + y, f: () => drawStall(x, y, stall) }); }
+    for (const k of blocked) {
+      const [x, y] = k.split(',').map(Number);
+      if (portalMap.has(k)) { const portal = portalMap.get(k)!; drawables.push({ s: x + y, f: () => drawPortal(x, y, portal) }); }
+      else if (stallMap.has(k)) { const stall = stallMap.get(k)!; drawables.push({ s: x + y, f: () => drawStall(x, y, stall) }); }
       else { drawables.push({ s: x + y, f: () => drawCrate(x, y) }); }
     }
-    for (var p of players.values()) drawables.push({ s: p.rx + p.ry + 0.5, f: () => drawPlayer(p, now) });
+    for (const p of players.values()) drawables.push({ s: p.rx + p.ry + 0.5, f: () => drawPlayer(p, now) });
     drawables.sort((a, b) => a.s - b.s);
     for (var d of drawables) d.f();
   }
