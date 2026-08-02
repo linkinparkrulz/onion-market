@@ -27,6 +27,7 @@ interface Player extends PlayerState {
   palette: string[];
   variant: SamuraiVariant;
   cutout: CutResult | null;
+  sprite128: HTMLCanvasElement | null;
   sprite: HTMLCanvasElement | null;
   facing: number;
   tx: number; ty: number;
@@ -147,11 +148,24 @@ function cutout(img: HTMLImageElement): CutResult | null {
   return { cv, minX, maxX, minY, maxY, shoulderMin: sMin, shoulderMax: sMax };
 }
 
-// Composite the exact cut-out bust on top of a dark procedural lower body sized to the
-// bust's shoulders and colour-matched to its armour.
-function drawCharacter(ctx: CanvasRenderingContext2D, cut: CutResult, sx: number, feetY: number, headH: number, walkFrame: number, flip: boolean, bob: number): void {
+// Bake a player's character into a fixed 128px-native pixel sprite: the extracted avatar
+// bust downsampled into the grid + a samurai body drawn at the same grid, so bust and body
+// share one pixel size and the whole thing reads as cohesive 128-bit pixel-art. Built once
+// per player; deterministic (pure function of the avatar PNG).
+const NAT_H = 128, BUST_H = 82;
+function buildSprite128(cut: CutResult): HTMLCanvasElement | null {
   const cropW = cut.maxX - cut.minX, cropH = cut.maxY - cut.minY;
-  const s = headH / cropH, shoulder = (cut.shoulderMax - cut.shoulderMin) * s;
+  if (cropW <= 0 || cropH <= 0) return null;
+  const scale = BUST_H / cropH;
+  const bustW = Math.max(1, Math.round(cropW * scale));
+  const shoulder = Math.max(10, Math.round((cut.shoulderMax - cut.shoulderMin) * scale));
+  const spriteW = Math.max(bustW, Math.round(shoulder * 1.45)) + 4;
+  const cv = document.createElement('canvas'); cv.width = spriteW; cv.height = NAT_H;
+  const g = cv.getContext('2d'); if (!g) return null;
+  g.imageSmoothingEnabled = false;
+  const midX = Math.round(spriteW / 2);
+
+  // Armour colour sampled from the bust's lowest opaque rows (connects body to bust).
   let rr = 40, gg = 40, bb = 48;
   const bctx = cut.cv.getContext('2d');
   if (bctx) {
@@ -160,55 +174,37 @@ function drawCharacter(ctx: CanvasRenderingContext2D, cut: CutResult, sx: number
     for (let i = 0; i < bd.length; i += 4) if (bd[i + 3] > 200) { R += bd[i]; G += bd[i + 1]; B += bd[i + 2]; n++; }
     if (n) { rr = R / n; gg = G / n; bb = B / n; }
   }
-  const arm = `rgb(${rr | 0},${gg | 0},${bb | 0})`, dark = `rgb(${rr * 0.6 | 0},${gg * 0.6 | 0},${bb * 0.6 | 0})`, boot = `rgb(${rr * 0.42 | 0},${gg * 0.42 | 0},${bb * 0.42 | 0})`;
+  const arm = `rgb(${rr | 0},${gg | 0},${bb | 0})`, dark = `rgb(${rr * 0.6 | 0},${gg * 0.6 | 0},${bb * 0.6 | 0})`, boot = `rgb(${rr * 0.5 | 0},${gg * 0.5 | 0},${bb * 0.5 | 0})`;
   const seam = `rgb(${Math.min(255, rr * 1.7) | 0},${Math.min(255, gg * 1.7) | 0},${Math.min(255, bb * 1.8) | 0})`;
   const GOLD = 'rgb(217,164,65)', LACE = '#2f45c8', LACED = '#1e2c86';
-  // Habbo/Coke-Music stature: big head (bust) dominates; compact chunky body below.
-  const bodyH = headH * 0.9;
-  const bootH = bodyH * 0.20, legH = bodyH * 0.20, skirtH = bodyH * 0.44, torsoH = bodyH * 0.16, ov = headH * 0.06;
-  const hw = Math.max(6, shoulder / 2), legOff = walkFrame ? Math.max(1, bodyH * 0.05) : 0;
-  const legTop = feetY - bootH - legH, skirtTop = legTop - skirtH, torsoTop = skirtTop - torsoH;
-  const bustBottom = torsoTop + ov, bustTop = bustBottom - headH + bob;
-  ctx.save();
-  if (flip) { ctx.translate(sx * 2, 0); ctx.scale(-1, 1); }
+  const R = (x: number, y: number, w: number, h: number, c: string): void => { g.fillStyle = c; g.fillRect(Math.round(midX + x), Math.round(y), Math.max(1, Math.round(w)), Math.max(1, Math.round(h))); };
 
-  // Big chunky boots with gold toe caps
-  const bw = hw * 0.6;
-  ctx.fillStyle = boot;
-  ctx.fillRect(sx - hw * 0.72, feetY - bootH, bw, bootH);
-  ctx.fillRect(sx + hw * 0.72 - bw, feetY - bootH + legOff, bw, bootH);
-  ctx.fillStyle = GOLD;
-  ctx.fillRect(sx - hw * 0.72, feetY - 2, bw, 2);
-  ctx.fillRect(sx + hw * 0.72 - bw, feetY - 2 + legOff, bw, 2);
-  // Short stubby legs (hakama)
-  ctx.fillStyle = dark;
-  ctx.fillRect(sx - hw * 0.66, legTop, hw * 0.58, legH + 1);
-  ctx.fillRect(sx + hw * 0.08, legTop + legOff, hw * 0.58, legH + 1);
+  // Body layout in native px (Habbo stature: big head, compact body).
+  const ov = 8, torsoTop = BUST_H - ov, skirtTop = torsoTop + 10, skirtH = 24;
+  const legTop = skirtTop + skirtH, legH = 12, bootTop = legTop + legH, bootH = NAT_H - bootTop;
+  const hw = shoulder / 2;
 
-  // Kusazuri skirt: layered lamellar plate rows, flaring, gold-trimmed
-  const ROWS = 3;
+  R(-hw, torsoTop, hw * 2, skirtTop - torsoTop + 2, arm);            // torso continuation
+  const ROWS = 3;                                                    // kusazuri skirt
   for (let r = 0; r < ROWS; r++) {
-    const t = skirtTop + (skirtH / ROWS) * r, rb = skirtTop + (skirtH / ROWS) * (r + 1);
-    const wT = hw * (1.0 + r * 0.13), wB = hw * (1.0 + (r + 1) * 0.13);
-    ctx.fillStyle = arm;
-    ctx.beginPath(); ctx.moveTo(sx - wT, t); ctx.lineTo(sx + wT, t); ctx.lineTo(sx + wB, rb - 1); ctx.lineTo(sx - wB, rb - 1); ctx.closePath(); ctx.fill();
-    ctx.fillStyle = seam;
-    for (let k = -2; k <= 2; k++) ctx.fillRect(sx + k * wB * 0.4 - 0.5, t + 1, 1, rb - t - 2);
-    ctx.fillStyle = GOLD; ctx.fillRect(sx - wB, rb - 2, wB * 2, 1.5);
+    const t = skirtTop + (skirtH / ROWS) * r, wB = hw * (1 + (r + 1) * 0.12);
+    R(-wB, t, wB * 2, skirtH / ROWS - 1, arm);
+    g.fillStyle = seam; for (let k = -2; k <= 2; k++) g.fillRect(Math.round(midX + k * wB * 0.4), Math.round(t), 1, Math.round(skirtH / ROWS - 1));
+    R(-wB, t + skirtH / ROWS - 2, wB * 2, 1.5, GOLD);
   }
-  // Front tasset with blue odoshi lacing down the centre
-  ctx.fillStyle = LACED; ctx.fillRect(sx - hw * 0.24, skirtTop, hw * 0.48, skirtH);
-  ctx.fillStyle = LACE;
-  for (let r = 0; r < 4; r++) { const y = skirtTop + (skirtH / 4) * (r + 0.5); ctx.fillRect(sx - hw * 0.2, y - 1.5, hw * 0.4, 3); }
+  R(-hw * 0.24, skirtTop, hw * 0.48, skirtH, LACED);                 // front tasset
+  for (let r = 0; r < 4; r++) R(-hw * 0.2, skirtTop + (skirtH / 4) * r + 1, hw * 0.4, 2.5, LACE);
+  R(-hw * 0.62, legTop, hw * 0.5, legH, dark);                       // legs
+  R(hw * 0.12, legTop, hw * 0.5, legH, dark);
+  R(-hw * 0.7, bootTop, hw * 0.56, bootH, boot);                     // boots + gold toes
+  R(hw * 0.14, bootTop, hw * 0.56, bootH, boot);
+  R(-hw * 0.7, NAT_H - 2, hw * 0.56, 2, GOLD);
+  R(hw * 0.14, NAT_H - 2, hw * 0.56, 2, GOLD);
 
-  // Do (torso continuation) — mostly hidden under the bust overlap
-  ctx.fillStyle = arm; ctx.fillRect(sx - hw, torsoTop + bob, hw * 2, torsoH + ov);
-  ctx.fillStyle = GOLD; ctx.fillRect(sx - hw, torsoTop + torsoH + bob - 1, hw * 2, 1.2);
-
-  // Exact avatar bust on top
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(cut.cv, cut.minX, cut.minY, cropW, cropH, sx - cropW * s / 2, bustTop, cropW * s, headH);
-  ctx.restore();
+  // The exact avatar bust, downsampled into the 128 grid → pixelated to match the body.
+  g.imageSmoothingEnabled = false;
+  g.drawImage(cut.cv, cut.minX, cut.minY, cropW, cropH, midX - bustW / 2, 0, bustW, BUST_H);
+  return cv;
 }
 
 function extractPalette(img: HTMLImageElement): string[] {
@@ -317,13 +313,14 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
     const player: Player = {
       ...p, img, palette: ['#c8b890', '#5a4a6a', '#3a3a4a', '#8a6a45'],
       variant: makeVariant(p.avatar),
-      cutout: null, sprite: null, facing: 0,
+      cutout: null, sprite128: null, sprite: null, facing: 0,
       tx: p.x, ty: p.y, rx: p.x, ry: p.y,
       path: [], nextStepAt: 0, bubble: null,
     };
     img.onload = function() {
       player.palette = extractPalette(img);
-      player.cutout = cutout(img);   // isolate the real avatar → rendered as the character
+      player.cutout = cutout(img);   // isolate the real avatar → bake into a 128-bit sprite
+      player.sprite128 = player.cutout ? buildSprite128(player.cutout) : null;
       if (spriteSheet) {
         player.sprite = createPlayerSprite(img, player.palette, spriteSheet);
       }
@@ -591,9 +588,14 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
       ctx.beginPath(); ctx.ellipse(sx, feetY, 14, 6, 0, 0, Math.PI * 2); ctx.stroke();
     }
 
-    if (p.cutout) {
-      // --- Real avatar: exact cut-out bust + extended body ---
-      drawCharacter(ctx, p.cutout, sx, feetY, 40, moving ? walkFrame & 1 : 0, dir === 2, bob);
+    if (p.sprite128) {
+      // --- 128-bit pixel sprite: pixelated avatar bust + matching pixel body ---
+      const spr = p.sprite128, dispH = 96, sc = dispH / spr.height, dispW = spr.width * sc;
+      ctx.imageSmoothingEnabled = false;
+      ctx.save();
+      if (dir === 2) { ctx.translate(sx * 2, 0); ctx.scale(-1, 1); }
+      ctx.drawImage(spr, Math.round(sx - dispW / 2), Math.round(feetY - dispH + bob), Math.round(dispW), Math.round(dispH));
+      ctx.restore();
     } else if (p.sprite) {
       // --- Sprite sheet mode ---
       ctx.imageSmoothingEnabled = false;
