@@ -34,6 +34,7 @@
     // SSO: if token is in URL (from directory portal redirect), skip auth
     var urlParams = new URLSearchParams(location.search);
     var directToken = urlParams.get('token');
+    var roomParam = urlParams.get('room');
     if (directToken) {
       say('entering...');
       // Clean URL (remove ?token= so it's not visible/shared)
@@ -64,7 +65,8 @@
 
     function enter(token) {
       var proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      var ws = new WebSocket(proto + '://' + location.host + '/ws?token=' + token);
+      var wsUrl = proto + '://' + location.host + '/ws?token=' + token + (roomParam ? '&room=' + encodeURIComponent(roomParam) : '');
+      var ws = new WebSocket(wsUrl);
       ws.onmessage = function(ev) {
         var m = JSON.parse(ev.data);
         if (m.t !== 'init') return;

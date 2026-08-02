@@ -1,0 +1,18 @@
+{
+  "name": "Barn Jerky",
+  "w": 10,
+  "h": 10,
+  "blocked": ["0,0"],
+  "stalls": [
+    {
+      "tile": "4,4",
+      "name": "Grass-fed Jerky",
+      "payCode": "PM8TJS2JxQ5ztXUpBBRnpTbcUXbUHy2T1abfrb3KkAAtWA9DdLYFwF6EbEG9AFCTNTsQEz9E4EnKUwNQVkbxvsvo9tLuufQrbXLTf1GNGvpaN9CyWCU",
+      "wares": [
+        { "name": "Original Beef Jerky", "priceSats": 25000, "desc": "5oz bag, grass-fed & finished" },
+        { "name": "Spicy Bitcoin Blend", "priceSats": 30000, "desc": "habanero + citra hops" },
+        { "name": "Sats Snack Pack", "priceSats": 12000, "desc": "trail-sized, stack while you stack" }
+      ]
+    }
+  ]
+}
