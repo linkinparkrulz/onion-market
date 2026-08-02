@@ -1,0 +1,79 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>The Barn</title>
+<style>
+  html,body{margin:0;height:100%;background:#17121f;color:#eee;font-family:monospace}
+  #login{padding:2rem}
+  #room{position:fixed;inset:0;display:flex;flex-direction:column}
+  #room-canvas{flex:1;width:100%;cursor:pointer}
+  #chat-bar{display:flex;padding:.5rem;background:#0e0a14}
+  #chat-input{flex:1;background:#1d1628;border:1px solid #3b2d4a;color:#eee;font-family:monospace;padding:.5rem}
+  #chat-log{position:absolute;top:.5rem;left:.5rem;width:36ch;max-height:45vh;overflow-y:auto;
+    background:rgba(0,0,0,.55);padding:.5rem;font-size:11px;white-space:pre-wrap;pointer-events:auto}
+</style></head>
+<body>
+  <div id="login">
+    <h1>the barn</h1>
+    <p>scan with samourai / ashigaru / sparrow:</p>
+    <img id="qr" width="260"><br>
+    <p id="status">loading...</p>
+  </div>
+  <div id="room" hidden>
+    <canvas id="room-canvas"></canvas>
+    <pre id="chat-log"></pre>
+    <div id="chat-bar"><input id="chat-input" placeholder="say something..." maxlength="140"></div>
+  </div>
+  <script type="module">
+    import { bootRoom } from './engine.js';
+    var $ = function(id) { return document.getElementById(id); };
+    var say = function(t) { $('status').textContent = t; };
+    window.addEventListener('error', function(e) { say('JS error: ' + e.message); });
+    window.addEventListener('unhandledrejection', function(e) {
+      say('promise error: ' + (e.reason && e.reason.message ? e.reason.message : e.reason));
+    });
+
+    // SSO: if token is in URL (from directory portal redirect), skip auth
+    var urlParams = new URLSearchParams(location.search);
+    var directToken = urlParams.get('token');
+    if (directToken) {
+      say('entering...');
+      // Clean URL (remove ?token= so it's not visible/shared)
+      history.replaceState(null, '', '/');
+      enter(directToken);
+    } else {
+      startAuth();
+    }
+
+    function startAuth() {
+      say('fetching challenge...');
+      fetch('/api/auth47/challenge').then(function(r) { return r.json(); }).then(function(ch) {
+        $('qr').src = ch.qr;
+        say('challenge ' + ch.nonce.slice(0, 8) + ' - scan QR to sign');
+        var ticks = 0;
+        var poll = setInterval(function() {
+          ticks++;
+          say('polling ' + ticks + ' (nonce ' + ch.nonce.slice(0, 8) + ')');
+          fetch('/api/auth47/status/' + ch.nonce).then(function(r) {
+            if (r.status !== 200) return;
+            clearInterval(poll);
+            say('entering...');
+            r.json().then(function(data) { enter(data.token); });
+          });
+        }, 2000);
+      });
+    }
+
+    function enter(token) {
+      var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      var ws = new WebSocket(proto + '://' + location.host + '/ws?token=' + token);
+      ws.onmessage = function(ev) {
+        var m = JSON.parse(ev.data);
+        if (m.t !== 'init') return;
+        $('login').hidden = true;
+        $('room').hidden = false;
+        bootRoom(ws, m);
+      };
+      ws.onerror = function() { say('websocket error'); };
+      ws.onclose = function(e) { say('websocket closed: ' + e.code); };
+    }
+  </script>
+</body></html>

@@ -1,0 +1,19 @@
+services:
+  app:
+    build: .
+    environment:
+      PORT: "3000"
+      BASE_URL: ${BASE_URL:-http://localhost:3000}
+      TOR_SOCKS: socks5://tor:9050
+    restart: unless-stopped
+
+  tor:
+    build: ./tor
+    volumes:
+      - ./tor/torrc:/etc/tor/torrc:ro
+      - torkeys:/var/lib/tor/barnroom
+    depends_on: [app]
+    restart: unless-stopped
+
+volumes:
+  torkeys:
