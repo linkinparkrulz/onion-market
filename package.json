@@ -3,7 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "engines": { "node": ">=23.6" },
+  "engines": {
+    "node": ">=23.6"
+  },
   "scripts": {
     "build": "esbuild client/engine.ts --bundle --format=esm --outfile=public/engine.js",
     "watch": "npm run build -- --watch",
@@ -11,10 +13,11 @@
     "start": "node server/index.ts"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^1.0.3",
     "@samouraiwallet/auth47": "1.2.1",
-    "tiny-secp256k1": "^2.2.3",
     "qrcode": "^1.5.4",
     "socks-proxy-agent": "^8.0.4",
+    "tiny-secp256k1": "^2.2.3",
     "ws": "^8.18.0"
   },
   "devDependencies": {
