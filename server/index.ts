@@ -221,7 +221,11 @@ const server = http.createServer(async (req: IncomingMessage, res: ServerRespons
   if (!p.startsWith(PUBLIC)) return json(res, 403, {});
   try {
     const data = await readFile(p);
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(p)] ?? 'application/octet-stream' });
+    const ext = path.extname(p);
+    const headers: Record<string, string> = { 'Content-Type': MIME[ext] ?? 'application/octet-stream' };
+    // Never let the HTML/JS bundle go stale (no cache-busting on the filename).
+    if (ext === '.html' || ext === '.js') headers['Cache-Control'] = 'no-store';
+    res.writeHead(200, headers);
     res.end(data);
   } catch { json(res, 404, { error: 'not found' }); }
 });
