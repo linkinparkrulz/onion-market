@@ -8,6 +8,7 @@ import { randomBytes } from 'node:crypto';
 import QRCode from 'qrcode';
 import { Auth47Service } from './auth47.ts';
 import { PayNymService, avatarIdFor } from './paynym.ts';
+import { CharacterService } from './character.ts';
 import { Room } from './room.ts';
 import { loadOrCreateIdentity } from './identity.ts';
 import { mintSSOToken, verifySSOToken, parseSSO } from './sso.ts';
@@ -57,6 +58,9 @@ const gossip = new Gossip({
 
 const auth = new Auth47Service({ callbackUrl: BASE_URL + '/api/auth47/callback' });
 const nyms = new PayNymService(path.join(ROOT, 'cache', 'avatars'));
+// Server-side character sprite generation (Tor Browser blocks client-side canvas readback).
+const chars = new CharacterService({ cacheDir: path.join(ROOT, 'cache', 'characters'), bodyPath: path.join(PUBLIC, 'assets', 'samurai-body.png') });
+chars.init();
 
 // Mint a destination-bound SSO token, but only for onions we actually trust as peers.
 const mint = (payCode: string, nym: string | null, dest: string): string | null => {
@@ -201,6 +205,17 @@ const server = http.createServer(async (req: IncomingMessage, res: ServerRespons
     } catch { return json(res, 404, { error: 'avatar unavailable' }); }
   }
 
+  // --- Character sprite (built server-side; the browser only draws it) ---
+  if (url.pathname.startsWith('/api/character/') && req.method === 'GET') {
+    const id = (url.pathname.split('/').pop() ?? '').replace(/\.png$/, '');
+    const png = await chars.build(id, nyms.fileForId(id)).catch(() => null);
+    if (png) {
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' });
+      return res.end(png);
+    }
+    return json(res, 404, { error: 'character unavailable' });
+  }
+
   // --- Static files ---
   const p = path.join(PUBLIC, url.pathname === '/' ? 'index.html' : url.pathname);
   if (!p.startsWith(PUBLIC)) return json(res, 403, {});
@@ -218,7 +233,10 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
   const sess = auth.getSession(token);
   console.log('[ws] connection, token', token.slice(0, 8) + '...', sess ? 'session OK' : 'REJECTED');
   if (!sess) return ws.close(4001, 'unauthorized');
-  nyms.ensureAvatarById(sess.avatar, sess.paymentCode).catch(() => {});
+  // Pre-warm avatar → character sprite so it's ready when other clients request it.
+  nyms.ensureAvatarById(sess.avatar, sess.paymentCode)
+    .then(() => chars.build(sess.avatar, nyms.fileForId(sess.avatar)))
+    .catch(() => {});
   const roomName = u.searchParams.get('room') ?? 'directory';
   const r = roomName === 'vendor' && vendorRoom ? vendorRoom : directoryRoom;
   r.join(ws, sess);

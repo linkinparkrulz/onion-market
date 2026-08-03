@@ -26,8 +26,8 @@ interface Player extends PlayerState {
   img: HTMLImageElement;
   palette: string[];
   variant: SamuraiVariant;
-  cutout: CutResult | null;
-  sprite128: HTMLCanvasElement | null;
+  charImg: HTMLImageElement;   // server-built character sprite PNG
+  charReady: boolean;
   sprite: HTMLCanvasElement | null;
   facing: number;
   tx: number; ty: number;
@@ -320,39 +320,28 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
     ss.src = '/assets/character-base.png';
   })();
 
-  // Load the shared reference body (character.png); background-removed once, then recolored
-  // per avatar + topped with each player's own bust.
-  (function loadBody() {
-    var bi = new Image();
-    bi.onload = function() {
-      bodyClean = cutout(bi);
-      console.log('[engine] reference body', bodyClean ? 'ready' : 'cutout failed');
-      for (var p of players.values()) if (p.cutout) p.sprite128 = buildSprite128(p.cutout, p.palette);
-    };
-    bi.onerror = function() { console.log('[engine] no reference body asset'); };
-    bi.src = '/assets/samurai-body.png';
-  })();
-
   const send = (m: ClientMsg): void => ws.send(JSON.stringify(m));
 
   function addPlayer(p: PlayerState): void {
+    // The character sprite is built SERVER-SIDE (Tor Browser blocks client canvas readback).
+    // The browser only draws the PNG; the raw avatar is loaded solely for the fallback visor.
     const img = new Image();
+    img.src = '/api/avatar/' + p.avatar;
+    const charImg = new Image();
     const player: Player = {
       ...p, img, palette: ['#c8b890', '#5a4a6a', '#3a3a4a', '#8a6a45'],
       variant: makeVariant(p.avatar),
-      cutout: null, sprite128: null, sprite: null, facing: 0,
+      charImg, charReady: false, sprite: null, facing: 0,
       tx: p.x, ty: p.y, rx: p.x, ry: p.y,
       path: [], nextStepAt: 0, bubble: null,
     };
-    img.onload = function() {
-      player.palette = extractPalette(img);
-      player.cutout = cutout(img);   // isolate the real avatar → bake into a 128-bit sprite
-      player.sprite128 = player.cutout ? buildSprite128(player.cutout, player.palette) : null;
-      if (spriteSheet) {
-        player.sprite = createPlayerSprite(img, player.palette, spriteSheet);
-      }
+    var tries = 0;
+    var loadChar = function() {
+      charImg.onload = function() { player.charReady = true; };
+      charImg.onerror = function() { if (tries++ < 8) setTimeout(loadChar, 1500); };  // may still be generating
+      charImg.src = '/api/character/' + p.avatar + '.png';
     };
-    img.src = '/api/avatar/' + p.avatar;
+    loadChar();
     players.set(p.id, player);
   }
   init.players.forEach(addPlayer);
@@ -615,9 +604,9 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
       ctx.beginPath(); ctx.ellipse(sx, feetY, 14, 6, 0, 0, Math.PI * 2); ctx.stroke();
     }
 
-    if (p.sprite128) {
-      // --- 128-bit pixel sprite: pixelated avatar bust + matching pixel body ---
-      const spr = p.sprite128, dispH = 112, sc = dispH / spr.height, dispW = spr.width * sc;
+    if (p.charReady) {
+      // --- Server-built 128-bit character sprite: draw it (no canvas readback) ---
+      const spr = p.charImg, dispH = 112, sc = dispH / spr.naturalHeight, dispW = spr.naturalWidth * sc;
       ctx.imageSmoothingEnabled = false;
       ctx.save();
       if (dir === 2) { ctx.translate(sx * 2, 0); ctx.scale(-1, 1); }
