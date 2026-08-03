@@ -148,62 +148,76 @@ function cutout(img: HTMLImageElement): CutResult | null {
   return { cv, minX, maxX, minY, maxY, shoulderMin: sMin, shoulderMax: sMax };
 }
 
-// Bake a player's character into a fixed 128px-native pixel sprite: the extracted avatar
-// bust downsampled into the grid + a samurai body drawn at the same grid, so bust and body
-// share one pixel size and the whole thing reads as cohesive 128-bit pixel-art. Built once
-// per player; deterministic (pure function of the avatar PNG).
-const NAT_H = 128, BUST_H = 82;
-function buildSprite128(cut: CutResult): HTMLCanvasElement | null {
-  const cropW = cut.maxX - cut.minX, cropH = cut.maxY - cut.minY;
-  if (cropW <= 0 || cropH <= 0) return null;
-  const scale = BUST_H / cropH;
-  const bustW = Math.max(1, Math.round(cropW * scale));
-  const shoulder = Math.max(10, Math.round((cut.shoulderMax - cut.shoulderMin) * scale));
-  const spriteW = Math.max(bustW, Math.round(shoulder * 1.45)) + 4;
-  const cv = document.createElement('canvas'); cv.width = spriteW; cv.height = NAT_H;
+// Shared reference body (character.png), background-removed once via cutout(). Recolored
+// per-avatar and topped with the player's own bust in buildSprite128.
+let bodyClean: CutResult | null = null;
+
+// The avatar's "clan" colour = its most-saturated palette entry.
+function pickClan(pal: string[]): [number, number, number] {
+  let best: [number, number, number] = [47, 69, 200], bs = -1;
+  for (const c of pal) { const rgb = parseColor(c); const mx = Math.max(...rgb), mn = Math.min(...rgb); const s = mx ? (mx - mn) / mx : 0; if (s > bs) { bs = s; best = rgb; } }
+  return best;
+}
+
+// Bake a player's character into a 128-bit pixel sprite: the shared reference body,
+// recolored to the avatar's clan colour, with the player's pixelated bust on top. Built
+// once per player; deterministic (pure function of avatar PNG + palette).
+const SPR_H = 150;                 // native pixel-art height ("fine 128-ish")
+const SHOULDER_Y = 0.50;           // erase the reference down past its pauldrons; bust supplies head+shoulders
+function buildSprite128(cut: CutResult, palette: string[]): HTMLCanvasElement | null {
+  if (!bodyClean) return null;
+  const src = bodyClean.cv, sw = src.width, sh = src.height;
+  const scale = SPR_H / sh, W = Math.round(sw * scale), H = SPR_H;
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
   const g = cv.getContext('2d'); if (!g) return null;
   g.imageSmoothingEnabled = false;
-  const midX = Math.round(spriteW / 2);
 
-  // Armour colour sampled from the bust's lowest opaque rows (connects body to bust).
-  let rr = 40, gg = 40, bb = 48;
-  const bctx = cut.cv.getContext('2d');
-  if (bctx) {
-    const bd = bctx.getImageData(cut.shoulderMin, Math.max(0, cut.maxY - 6), Math.max(1, cut.shoulderMax - cut.shoulderMin), 6).data;
-    let R = 0, G = 0, B = 0, n = 0;
-    for (let i = 0; i < bd.length; i += 4) if (bd[i + 3] > 200) { R += bd[i]; G += bd[i + 1]; B += bd[i + 2]; n++; }
-    if (n) { rr = R / n; gg = G / n; bb = B / n; }
+  // 1. Downsample the (already background-free) reference body → pixelate.
+  g.drawImage(src, 0, 0, sw, sh, 0, 0, W, H);
+
+  // 2. Recolor the blue accents (sash / odoshi lacing / ties) → clan colour, preserving
+  //    each pixel's luminance so the pixel-art shading survives.
+  const clan = pickClan(palette);
+  const clanLum = Math.max(1, 0.3 * clan[0] + 0.59 * clan[1] + 0.11 * clan[2]);
+  const d = g.getImageData(0, 0, W, H), a = d.data;
+  for (let i = 0; i < a.length; i += 4) {
+    if (a[i + 3] < 30) continue;
+    const r = a[i], gr = a[i + 1], b = a[i + 2], mx = Math.max(r, gr, b), mn = Math.min(r, gr, b);
+    if (b > r + 22 && b > gr + 18 && mx - mn > 40) {            // saturated blue
+      const f = (0.3 * r + 0.59 * gr + 0.11 * b) / clanLum;
+      a[i] = Math.min(255, clan[0] * f); a[i + 1] = Math.min(255, clan[1] * f); a[i + 2] = Math.min(255, clan[2] * f);
+    }
   }
-  const arm = `rgb(${rr | 0},${gg | 0},${bb | 0})`, dark = `rgb(${rr * 0.6 | 0},${gg * 0.6 | 0},${bb * 0.6 | 0})`, boot = `rgb(${rr * 0.5 | 0},${gg * 0.5 | 0},${bb * 0.5 | 0})`;
-  const seam = `rgb(${Math.min(255, rr * 1.7) | 0},${Math.min(255, gg * 1.7) | 0},${Math.min(255, bb * 1.8) | 0})`;
-  const GOLD = 'rgb(217,164,65)', LACE = '#2f45c8', LACED = '#1e2c86';
-  const R = (x: number, y: number, w: number, h: number, c: string): void => { g.fillStyle = c; g.fillRect(Math.round(midX + x), Math.round(y), Math.max(1, Math.round(w)), Math.max(1, Math.round(h))); };
+  g.putImageData(d, 0, 0);
 
-  // Body layout in native px (Habbo stature: big head, compact body).
-  const ov = 8, torsoTop = BUST_H - ov, skirtTop = torsoTop + 10, skirtH = 24;
-  const legTop = skirtTop + skirtH, legH = 12, bootTop = legTop + legH, bootH = NAT_H - bootTop;
-  const hw = shoulder / 2;
+  // 3. Torso centroid over the region below the neck (the katana is too thin to skew it),
+  //    so the head centers on the body rather than the out-held sword.
+  const shoulderY = Math.round(H * SHOULDER_Y);
+  let cxSum = 0, cxN = 0;
+  for (let y = shoulderY; y < H; y++) for (let x = 0; x < W; x++) if (a[(y * W + x) * 4 + 3] > 40) { cxSum += x; cxN++; }
+  const bodyCX = cxN ? cxSum / cxN : W / 2;
+  // Erase the reference head — the player's own avatar replaces it.
+  g.clearRect(0, 0, W, shoulderY);
 
-  R(-hw, torsoTop, hw * 2, skirtTop - torsoTop + 2, arm);            // torso continuation
-  const ROWS = 3;                                                    // kusazuri skirt
-  for (let r = 0; r < ROWS; r++) {
-    const t = skirtTop + (skirtH / ROWS) * r, wB = hw * (1 + (r + 1) * 0.12);
-    R(-wB, t, wB * 2, skirtH / ROWS - 1, arm);
-    g.fillStyle = seam; for (let k = -2; k <= 2; k++) g.fillRect(Math.round(midX + k * wB * 0.4), Math.round(t), 1, Math.round(skirtH / ROWS - 1));
-    R(-wB, t + skirtH / ROWS - 2, wB * 2, 1.5, GOLD);
+  // 4. Overlay the player's pixelated bust, centered on the torso, shoulders at the neck line.
+  const cropW = cut.maxX - cut.minX, cropH = cut.maxY - cut.minY;
+  // Robust shoulder width = widest opaque row in the lower ~45% of the bust (cutout's
+  // bottom-row metric is unreliable — e.g. max's bottom is narrow → huge scale).
+  let shW = cropW;
+  const bc2 = cut.cv.getContext('2d');
+  if (bc2) {
+    const ys = Math.round(cut.minY + cropH * 0.55), rows = Math.max(1, cut.maxY - ys);
+    const bd = bc2.getImageData(cut.minX, ys, cropW, rows).data;
+    let widest = 0;
+    for (let ry = 0; ry < rows; ry++) { let x1 = cropW, x2 = 0; for (let rx = 0; rx < cropW; rx++) if (bd[(ry * cropW + rx) * 4 + 3] > 60) { if (rx < x1) x1 = rx; if (rx > x2) x2 = rx; } if (x2 - x1 > widest) widest = x2 - x1; }
+    if (widest > 10) shW = widest;
   }
-  R(-hw * 0.24, skirtTop, hw * 0.48, skirtH, LACED);                 // front tasset
-  for (let r = 0; r < 4; r++) R(-hw * 0.2, skirtTop + (skirtH / 4) * r + 1, hw * 0.4, 2.5, LACE);
-  R(-hw * 0.62, legTop, hw * 0.5, legH, dark);                       // legs
-  R(hw * 0.12, legTop, hw * 0.5, legH, dark);
-  R(-hw * 0.7, bootTop, hw * 0.56, bootH, boot);                     // boots + gold toes
-  R(hw * 0.14, bootTop, hw * 0.56, bootH, boot);
-  R(-hw * 0.7, NAT_H - 2, hw * 0.56, 2, GOLD);
-  R(hw * 0.14, NAT_H - 2, hw * 0.56, 2, GOLD);
-
-  // The exact avatar bust, downsampled into the 128 grid → pixelated to match the body.
+  const s = (W * 0.56) / shW;                                   // shoulders ≈ body width
+  const bustW = cropW * s, bustH = cropH * s;
+  const destX = bodyCX - (cropW / 2) * s;                       // center the bbox on the torso
+  const destY = shoulderY + Math.round(H * 0.05) - bustH;       // bust bottom overlaps the chest seam
   g.imageSmoothingEnabled = false;
-  g.drawImage(cut.cv, cut.minX, cut.minY, cropW, cropH, midX - bustW / 2, 0, bustW, BUST_H);
+  g.drawImage(cut.cv, cut.minX, cut.minY, cropW, cropH, destX, destY, bustW, bustH);
   return cv;
 }
 
@@ -306,6 +320,19 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
     ss.src = '/assets/character-base.png';
   })();
 
+  // Load the shared reference body (character.png); background-removed once, then recolored
+  // per avatar + topped with each player's own bust.
+  (function loadBody() {
+    var bi = new Image();
+    bi.onload = function() {
+      bodyClean = cutout(bi);
+      console.log('[engine] reference body', bodyClean ? 'ready' : 'cutout failed');
+      for (var p of players.values()) if (p.cutout) p.sprite128 = buildSprite128(p.cutout, p.palette);
+    };
+    bi.onerror = function() { console.log('[engine] no reference body asset'); };
+    bi.src = '/assets/samurai-body.png';
+  })();
+
   const send = (m: ClientMsg): void => ws.send(JSON.stringify(m));
 
   function addPlayer(p: PlayerState): void {
@@ -320,7 +347,7 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
     img.onload = function() {
       player.palette = extractPalette(img);
       player.cutout = cutout(img);   // isolate the real avatar → bake into a 128-bit sprite
-      player.sprite128 = player.cutout ? buildSprite128(player.cutout) : null;
+      player.sprite128 = player.cutout ? buildSprite128(player.cutout, player.palette) : null;
       if (spriteSheet) {
         player.sprite = createPlayerSprite(img, player.palette, spriteSheet);
       }
@@ -590,7 +617,7 @@ export function bootRoom(ws: WebSocket, init: InitMsg): void {
 
     if (p.sprite128) {
       // --- 128-bit pixel sprite: pixelated avatar bust + matching pixel body ---
-      const spr = p.sprite128, dispH = 96, sc = dispH / spr.height, dispW = spr.width * sc;
+      const spr = p.sprite128, dispH = 112, sc = dispH / spr.height, dispW = spr.width * sc;
       ctx.imageSmoothingEnabled = false;
       ctx.save();
       if (dir === 2) { ctx.translate(sx * 2, 0); ctx.scale(-1, 1); }
